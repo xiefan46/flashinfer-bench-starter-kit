@@ -13,8 +13,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "solution", "triton"))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from kernel import kernel as kernel_v0, H, I, E_GLOBAL, E_LOCAL, BLOCK
-from kernel_v1 import kernel as kernel_v1
+from kernel_v1 import kernel as kernel_v1, H, I, E_GLOBAL, E_LOCAL, BLOCK
 from kernel_v2 import kernel as kernel_v2
 from kernel_v3 import kernel as kernel_v3
 from kernel_v4 import kernel as kernel_v4
@@ -23,7 +22,6 @@ from reference import run as reference_run
 DEVICE = "cuda"
 
 VERSIONS = {
-    "v0_baseline": kernel_v0,
     "v1_fused_dequant": kernel_v1,
     "v2_grouped_gemm": kernel_v2,
     "v3_fused_swiglu": kernel_v3,
@@ -32,7 +30,6 @@ VERSIONS = {
 
 # Tolerance per version: V2+ use bf16 dot product so allow slightly more error
 TOLERANCES = {
-    "v0_baseline": 1e-2,
     "v1_fused_dequant": 5e-2,
     "v2_grouped_gemm": 5e-2,
     "v3_fused_swiglu": 5e-2,

@@ -181,10 +181,17 @@ def kernel(
 
     # ---- 1) FP8 block-scale dequantization (fused, no repeat_interleave) ----
 
-    # Hidden states: [T, H], scale: [H/128, T] → transposed to [T, H/128]
-    A_scale_TH = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()
-    A = dequant_fp8_block_2d(hidden_states, A_scale_TH, T, H,
-                             A_scale_TH.stride(0), A_scale_TH.stride(1))
+    # Hidden states: [T, H] - scale is per-token, not per-block-of-tokens,
+    # so use PyTorch expansion (same as baseline; tiny tensor, not worth a kernel)
+    A_fp32 = hidden_states.to(torch.float32)
+    A_scale_TH = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()  # [T, H/128]
+    A_scale_expanded = (
+        A_scale_TH.unsqueeze(-1)
+        .repeat(1, 1, BLOCK)
+        .reshape(T, H)
+        .contiguous()
+    )
+    A = A_fp32 * A_scale_expanded  # [T, H] float32
 
     # W13: [E_LOCAL, 2I, H] → bf16 via 3D Triton dequant
     W13 = dequant_fp8_block_3d(gemm1_weights, gemm1_weights_scale)
@@ -225,8 +232,6 @@ def kernel(
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
-    A_f32 = A.float()
-
     for le in range(E_LOCAL):
         ge = local_start + le
         if ge < 0 or ge >= E_GLOBAL:
@@ -238,7 +243,7 @@ def kernel(
 
         token_idx = torch.nonzero(sel_mask_per_token, as_tuple=False).squeeze(1)
 
-        A_e = A_f32.index_select(0, token_idx)
+        A_e = A.index_select(0, token_idx)  # already fp32
         W13_e = W13[le].float()
         W2_e = W2[le].float()
 

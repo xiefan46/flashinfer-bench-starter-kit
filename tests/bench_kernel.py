@@ -1,5 +1,5 @@
 """
-Performance benchmark: kernel vs reference implementation.
+Performance benchmark: all kernel versions vs reference implementation.
 
 Measures latency, throughput, and speedup across various batch sizes (T).
 
@@ -14,13 +14,26 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "solution", "triton"))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from kernel import kernel, H, I, E_GLOBAL, E_LOCAL, BLOCK
+from kernel import kernel as kernel_v0, H, I, E_GLOBAL, E_LOCAL, BLOCK
+from kernel_v1 import kernel as kernel_v1
+from kernel_v2 import kernel as kernel_v2
+from kernel_v3 import kernel as kernel_v3
+from kernel_v4 import kernel as kernel_v4
 from reference import run as reference_run
 
 DEVICE = "cuda"
 WARMUP_ITERS = 3
 BENCH_ITERS = 10
 T_VALUES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+VERSIONS = {
+    "v0_baseline": kernel_v0,
+    "v1_fused_dequant": kernel_v1,
+    "v2_grouped_gemm": kernel_v2,
+    "v3_fused_swiglu": kernel_v3,
+    "v4_token_permute": kernel_v4,
+    "reference": reference_run,
+}
 
 
 def make_fp8_with_block_scale_2d(shape, block_size=128, device=DEVICE):
@@ -87,13 +100,11 @@ def make_bench_data(T, device=DEVICE):
 
 def bench_fn(fn, data, warmup, iters, label):
     """Benchmark a function with CUDA synchronization. Returns median latency in ms."""
-    # Warmup
     for i in range(warmup):
         print(f"    {label} warmup {i+1}/{warmup}", flush=True)
         fn(**data)
         torch.cuda.synchronize()
 
-    # Benchmark
     times = []
     for i in range(iters):
         torch.cuda.synchronize()
@@ -121,58 +132,93 @@ def main():
     print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
     print(f"Warmup: {WARMUP_ITERS}, Benchmark iters: {BENCH_ITERS}")
     print(f"T values: {T_VALUES}")
-    print("=" * 90)
+    print(f"Versions: {list(VERSIONS.keys())}")
+    print("=" * 120)
 
-    results = []
+    # Collect all results: results[T][version_name] = stats
+    all_results = {}
 
     for idx, T in enumerate(T_VALUES):
         print(f"\n[{idx+1}/{len(T_VALUES)}] Generating data for T={T} ...", flush=True)
         torch.manual_seed(42)
         data = make_bench_data(T)
         torch.cuda.synchronize()
-        print(f"  Data ready. Starting benchmark.", flush=True)
+        print(f"  Data ready. Starting benchmarks.", flush=True)
 
-        # Benchmark kernel
-        print(f"  Benchmarking kernel (T={T}) ...", flush=True)
-        kernel_stats = bench_fn(kernel, data, WARMUP_ITERS, BENCH_ITERS, "kernel")
+        t_results = {}
 
-        # Benchmark reference
-        print(f"  Benchmarking reference (T={T}) ...", flush=True)
-        ref_stats = bench_fn(reference_run, data, WARMUP_ITERS, BENCH_ITERS, "reference")
+        for v_name, v_fn in VERSIONS.items():
+            print(f"  Benchmarking {v_name} (T={T}) ...", flush=True)
+            try:
+                stats = bench_fn(v_fn, data, WARMUP_ITERS, BENCH_ITERS, v_name)
+                t_results[v_name] = stats
+                print(f"  => {v_name}: {stats['median_ms']:.2f} ms (median)", flush=True)
+            except Exception as e:
+                print(f"  => {v_name}: FAILED ({e})", flush=True)
+                t_results[v_name] = None
 
-        speedup = ref_stats["median_ms"] / kernel_stats["median_ms"] if kernel_stats["median_ms"] > 0 else float("inf")
-        kernel_tps = T / (kernel_stats["median_ms"] / 1000)
-        ref_tps = T / (ref_stats["median_ms"] / 1000)
+        all_results[T] = t_results
 
-        results.append({
-            "T": T,
-            "kernel_median_ms": kernel_stats["median_ms"],
-            "kernel_mean_ms": kernel_stats["mean_ms"],
-            "ref_median_ms": ref_stats["median_ms"],
-            "ref_mean_ms": ref_stats["mean_ms"],
-            "speedup": speedup,
-            "kernel_tps": kernel_tps,
-            "ref_tps": ref_tps,
-        })
-
-        print(f"  => kernel: {kernel_stats['median_ms']:.2f} ms (median), "
-              f"reference: {ref_stats['median_ms']:.2f} ms (median), "
-              f"speedup: {speedup:.2f}x", flush=True)
-
-        # Free data to reclaim memory
         del data
         torch.cuda.empty_cache()
 
     # Summary table
-    print("\n" + "=" * 90)
-    print("SUMMARY")
-    print("=" * 90)
-    print(f"{'T':>6} | {'Kernel (ms)':>12} | {'Reference (ms)':>14} | {'Speedup':>8} | {'Kernel TPS':>12} | {'Ref TPS':>12}")
-    print("-" * 90)
-    for r in results:
-        print(f"{r['T']:>6} | {r['kernel_median_ms']:>12.2f} | {r['ref_median_ms']:>14.2f} | "
-              f"{r['speedup']:>7.2f}x | {r['kernel_tps']:>12.1f} | {r['ref_tps']:>12.1f}")
-    print("=" * 90)
+    version_names = list(VERSIONS.keys())
+    col_width = 16
+
+    print("\n" + "=" * 120)
+    print("SUMMARY (median latency in ms)")
+    print("=" * 120)
+
+    # Header
+    header = f"{'T':>6}"
+    for v in version_names:
+        header += f" | {v:>{col_width}}"
+    print(header)
+    print("-" * len(header))
+
+    # Rows
+    for T in T_VALUES:
+        row = f"{T:>6}"
+        for v in version_names:
+            stats = all_results.get(T, {}).get(v)
+            if stats is None:
+                row += f" | {'FAILED':>{col_width}}"
+            else:
+                row += f" | {stats['median_ms']:>{col_width}.2f}"
+        print(row)
+
+    # Speedup table (vs reference)
+    ref_name = "reference"
+    print(f"\n{'='*120}")
+    print(f"SPEEDUP vs {ref_name}")
+    print("=" * 120)
+
+    header = f"{'T':>6}"
+    for v in version_names:
+        if v == ref_name:
+            continue
+        header += f" | {v:>{col_width}}"
+    print(header)
+    print("-" * len(header))
+
+    for T in T_VALUES:
+        ref_stats = all_results.get(T, {}).get(ref_name)
+        if ref_stats is None:
+            continue
+        row = f"{T:>6}"
+        for v in version_names:
+            if v == ref_name:
+                continue
+            stats = all_results.get(T, {}).get(v)
+            if stats is None:
+                row += f" | {'N/A':>{col_width}}"
+            else:
+                speedup = ref_stats["median_ms"] / stats["median_ms"]
+                row += f" | {speedup:>{col_width}.2f}x"
+        print(row)
+
+    print("=" * 120)
 
 
 if __name__ == "__main__":

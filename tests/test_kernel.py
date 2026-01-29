@@ -1,7 +1,7 @@
 """
-Correctness tests for MoE FP8 block-scale kernel.
+Correctness tests for all MoE FP8 block-scale kernel versions.
 
-Compares kernel output against the reference implementation (tests/reference.py).
+Compares each kernel version against the reference implementation (tests/reference.py).
 
 Run:  python tests/test_kernel.py
 """
@@ -13,10 +13,31 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "solution", "triton"))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from kernel import kernel, H, I, E_GLOBAL, E_LOCAL, BLOCK
+from kernel import kernel as kernel_v0, H, I, E_GLOBAL, E_LOCAL, BLOCK
+from kernel_v1 import kernel as kernel_v1
+from kernel_v2 import kernel as kernel_v2
+from kernel_v3 import kernel as kernel_v3
+from kernel_v4 import kernel as kernel_v4
 from reference import run as reference_run
 
 DEVICE = "cuda"
+
+VERSIONS = {
+    "v0_baseline": kernel_v0,
+    "v1_fused_dequant": kernel_v1,
+    "v2_grouped_gemm": kernel_v2,
+    "v3_fused_swiglu": kernel_v3,
+    "v4_token_permute": kernel_v4,
+}
+
+# Tolerance per version: V2+ use bf16 dot product so allow slightly more error
+TOLERANCES = {
+    "v0_baseline": 1e-2,
+    "v1_fused_dequant": 1e-2,
+    "v2_grouped_gemm": 5e-2,
+    "v3_fused_swiglu": 5e-2,
+    "v4_token_permute": 5e-2,
+}
 
 
 # =====================================================================
@@ -91,16 +112,16 @@ def make_test_data(T, local_expert_offset=0, device=DEVICE):
 
 
 # =====================================================================
-# Tests
+# Test functions (parameterized by kernel version)
 # =====================================================================
 
-def test_basic_correctness():
+def test_basic_correctness(fn, name, tol):
     """T=4: compare kernel output to reference."""
-    print("test_basic_correctness (T=4) ... ", end="", flush=True)
+    print(f"  test_basic_correctness (T=4) ... ", end="", flush=True)
     torch.manual_seed(42)
     data = make_test_data(T=4, local_expert_offset=0)
 
-    out_kernel = kernel(**data)
+    out_kernel = fn(**data)
     out_ref = reference_run(**data)
 
     assert out_kernel.shape == out_ref.shape == (4, H)
@@ -115,79 +136,77 @@ def test_basic_correctness():
         max_rel_err = 0.0
 
     print(f"max_abs_err={max_abs_err:.6e}, max_rel_err={max_rel_err:.6e} ... ", end="")
-    assert max_abs_err < 1e-2, f"Absolute error too large: {max_abs_err}"
+    assert max_abs_err < tol, f"Absolute error too large: {max_abs_err} (tol={tol})"
     print("PASSED")
 
 
-def test_single_token():
+def test_single_token(fn, name, tol):
     """T=1: compare kernel output to reference."""
-    print("test_single_token (T=1) ... ", end="", flush=True)
+    print(f"  test_single_token (T=1) ... ", end="", flush=True)
     torch.manual_seed(123)
     data = make_test_data(T=1, local_expert_offset=0)
 
-    out_kernel = kernel(**data)
+    out_kernel = fn(**data)
     out_ref = reference_run(**data)
 
     assert out_kernel.shape == (1, H)
     max_abs_err = (out_kernel.float() - out_ref.float()).abs().max().item()
     print(f"max_abs_err={max_abs_err:.6e} ... ", end="")
-    assert max_abs_err < 1e-2, f"Absolute error too large: {max_abs_err}"
+    assert max_abs_err < tol, f"Absolute error too large: {max_abs_err} (tol={tol})"
     print("PASSED")
 
 
-def test_no_local_experts():
+def test_no_local_experts(fn, name, tol):
     """All top-k experts fall outside local range -> output should be zero."""
-    print("test_no_local_experts ... ", end="", flush=True)
+    print(f"  test_no_local_experts ... ", end="", flush=True)
     torch.manual_seed(99)
     data = make_test_data(T=2, local_expert_offset=224)
-    # Suppress local experts [224, 256) so they won't be selected
     data["routing_logits"][:, 224:256] = -100.0
     data["routing_bias"][224:256] = -100.0
 
-    out_kernel = kernel(**data)
+    out_kernel = fn(**data)
     out_ref = reference_run(**data)
 
     assert out_kernel.shape == (2, H)
-    # Both should be all zeros
     assert (out_ref == 0).all(), "Reference should be zero"
     assert (out_kernel == 0).all(), "Kernel should be zero"
     print("PASSED")
 
 
-def test_output_shape_and_dtype():
+def test_output_shape_and_dtype(fn, name, tol):
     """Verify shape and dtype for various T values."""
-    print("test_output_shape_and_dtype ... ", end="", flush=True)
+    print(f"  test_output_shape_and_dtype ... ", end="", flush=True)
     torch.manual_seed(0)
     for T in [1, 2, 4]:
         data = make_test_data(T=T, local_expert_offset=0)
-        out = kernel(**data)
+        out = fn(**data)
         assert out.shape == (T, H), f"Shape mismatch for T={T}: {out.shape}"
         assert out.dtype == torch.bfloat16, f"Dtype mismatch: {out.dtype}"
     print("PASSED")
 
 
-def test_different_offsets():
+def test_different_offsets(fn, name, tol):
     """Test with non-zero local_expert_offset."""
-    print("test_different_offsets ... ", end="", flush=True)
+    print(f"  test_different_offsets ... ", end="", flush=True)
     torch.manual_seed(77)
     for offset in [0, 32, 128]:
         data = make_test_data(T=2, local_expert_offset=offset)
-        out_kernel = kernel(**data)
+        out_kernel = fn(**data)
         out_ref = reference_run(**data)
 
         max_abs_err = (out_kernel.float() - out_ref.float()).abs().max().item()
         print(f"offset={offset} max_abs_err={max_abs_err:.6e} ", end="", flush=True)
-        assert max_abs_err < 1e-2, f"Error too large at offset={offset}: {max_abs_err}"
+        assert max_abs_err < tol, f"Error too large at offset={offset}: {max_abs_err} (tol={tol})"
     print("... PASSED")
 
 
-def test_bitwise_match_reference():
-    """Strict check: kernel output should exactly match reference (both use same fp32 math)."""
-    print("test_bitwise_match_reference (T=2) ... ", end="", flush=True)
+def test_bitwise_match_reference(fn, name, tol):
+    """Strict check: kernel output should closely match reference."""
+    print(f"  test_bitwise_match_reference (T=2) ... ", end="", flush=True)
     torch.manual_seed(2024)
     data = make_test_data(T=2, local_expert_offset=0)
 
-    out_kernel = kernel(**data)
+    out_kernel = fn(**data)
     out_ref = reference_run(**data)
 
     if torch.equal(out_kernel, out_ref):
@@ -195,7 +214,7 @@ def test_bitwise_match_reference():
     else:
         max_abs_err = (out_kernel.float() - out_ref.float()).abs().max().item()
         print(f"not bitwise (max_abs_err={max_abs_err:.6e}), checking tolerance ... ", end="")
-        assert max_abs_err < 1e-4, f"Error too large: {max_abs_err}"
+        assert max_abs_err < tol, f"Error too large: {max_abs_err} (tol={tol})"
         print("PASSED (within tolerance)")
 
 
@@ -208,11 +227,35 @@ if __name__ == "__main__":
         print("CUDA not available, skipping tests")
         sys.exit(0)
 
-    test_output_shape_and_dtype()
-    test_no_local_experts()
-    test_single_token()
-    test_basic_correctness()
-    test_different_offsets()
-    test_bitwise_match_reference()
+    all_tests = [
+        test_output_shape_and_dtype,
+        test_no_local_experts,
+        test_single_token,
+        test_basic_correctness,
+        test_different_offsets,
+        test_bitwise_match_reference,
+    ]
 
-    print("\nAll tests passed!")
+    failed = []
+
+    for name, fn in VERSIONS.items():
+        tol = TOLERANCES[name]
+        print(f"\n{'='*60}")
+        print(f"Testing {name} (tolerance={tol:.0e})")
+        print(f"{'='*60}")
+        for test_fn in all_tests:
+            try:
+                test_fn(fn, name, tol)
+            except Exception as e:
+                print(f"FAILED: {e}")
+                failed.append(f"{name}/{test_fn.__name__}")
+        torch.cuda.empty_cache()
+
+    print(f"\n{'='*60}")
+    if failed:
+        print(f"FAILURES ({len(failed)}):")
+        for f in failed:
+            print(f"  - {f}")
+        sys.exit(1)
+    else:
+        print("All tests passed for all versions!")

@@ -36,7 +36,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     trace_set = TraceSet.from_path(trace_set_path)
 
     if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+        raise ValueError(f"Definition '{solution.definition}' not found in trace set. trace set definitions: {trace_set.definitions}")
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])

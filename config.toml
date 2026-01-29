@@ -1,6 +1,6 @@
 [solution]
 name = "my-team-solution-v1"      # Solution name
-definition = "moe"                # Track: moe | sparse_attention | gated_delta_net
+definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "team-name"              # Team/author name
 
 [build]
